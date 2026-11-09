@@ -129,8 +129,64 @@ local function SaveLicenseKey(key)
 end
 
 -- =========================================================================
--- 5. KEYGEN.SH API VALIDATION
+-- 5. KEYGEN.SH API VALIDATION & MACHINE ACTIVATION
 -- =========================================================================
+local function ActivateMachineWithKeygen(licenseId, licenseKey, fingerprint)
+    local HttpService = game:GetService("HttpService")
+    local endpoint = string.format("https://api.keygen.sh/v1/accounts/%s/machines", ACCOUNT_ID)
+
+    local payload = {
+        data = {
+            type = "machines",
+            attributes = {
+                fingerprint = fingerprint,
+                platform = "Roblox"
+            },
+            relationships = {
+                license = {
+                    data = {
+                        type = "licenses",
+                        id = licenseId
+                    }
+                }
+            }
+        }
+    }
+
+    local response = HttpRequest({
+        Url = endpoint,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/vnd.api+json",
+            ["Accept"] = "application/vnd.api+json",
+            ["Authorization"] = "License " .. tostring(licenseKey)
+        },
+        Body = HttpService:JSONEncode(payload)
+    })
+
+    if not response or not response.Body then
+        return false, "ไม่สามารถเชื่อมต่อเพื่อลงทะเบียนเครื่องได้"
+    end
+
+    local success, data = pcall(function()
+        return HttpService:JSONDecode(response.Body)
+    end)
+
+    if success and data and data.data and data.data.id then
+        return true, data.data.id
+    end
+
+    if success and data and data.errors then
+        for _, err in ipairs(data.errors) do
+            if err.code == "MACHINE_LIMIT_EXCEEDED" then
+                return false, "คีย์นี้ถูกใช้งานบนเครื่องอื่นแล้ว หรือจำนวนเครื่องเกินกำหนดที่ได้รับอนุญาต"
+            end
+        end
+    end
+
+    return false, "ไม่สามารถลงทะเบียนผูกเครื่องได้"
+end
+
 local function ValidateKeyWithKeygen(licenseKey)
     local HttpService = game:GetService("HttpService")
     local fingerprint = GetHardwareFingerprint()
@@ -176,38 +232,56 @@ local function ValidateKeyWithKeygen(licenseKey)
     local isValid = (meta.valid == true)
     local code = meta.code or "UNKNOWN"
     local detail = meta.detail or ""
+    local licenseId = data.data and data.data.id
+    local licenseData = data.data and data.data.attributes or {}
+    local expiry = licenseData.expiry or "ไม่มีวันหมดอายุ (Lifetime)"
+    local status = licenseData.status or "ACTIVE"
 
+    -- 1. กรณีคีย์และเครื่องนี้ผ่านการผูกสิทธิ์เรียบร้อยแล้ว
     if isValid then
-        local licenseData = data.data and data.data.attributes or {}
-        local expiry = licenseData.expiry or "ไม่มีวันหมดอายุ (Lifetime)"
-        local status = licenseData.status or "ACTIVE"
         return true, {
             status = status,
             expiry = expiry,
             detail = detail,
             key = licenseKey
         }, code
-    else
-        local reason = "License Key ไม่ถูกต้อง"
-        if code == "NOT_FOUND" then
-            reason = "ไม่พบคีย์นี้ในระบบ (" .. licenseKey .. ") กรุณาตรวจสอบความถูกต้อง"
-        elseif code == "EXPIRED" then
-            reason = "License Key นี้หมดอายุการใช้งานแล้ว กรุณาติดต่อร้านค้าเพื่อต่ออายุ"
-        elseif code == "SUSPENDED" then
-            reason = "License Key นี้ถูกระงับการใช้งานชั่วคราวหรือถาวร"
-        elseif code == "NO_MACHINE" or code == "NO_MACHINES" or code == "FINGERPRINT_SCOPE_MISMATCH" then
-            reason = "คีย์นี้ถูกใช้งานบนเครื่องอื่นแล้ว หรือจำนวนเครื่องเกินกำหนดที่ได้รับอนุญาต"
-        elseif detail and detail ~= "" then
-            reason = "ตรวจสอบไม่ผ่าน: " .. detail
-        end
-        return false, reason, code
     end
+
+    -- 2. กรณีเครื่องนี้เพิ่งรันเป็นครั้งแรก (ยังไม่มี HWID ผูกไว้) ให้ผูกเครื่องอัตโนมัติ
+    if code == "NO_MACHINE" or code == "NO_MACHINES" or code == "FINGERPRINT_SCOPE_MISMATCH" then
+        if licenseId then
+            local activated, actErr = ActivateMachineWithKeygen(licenseId, licenseKey, fingerprint)
+            if activated then
+                return true, {
+                    status = status,
+                    expiry = expiry,
+                    detail = "ลงทะเบียนเครื่องครั้งแรกสำเร็จ",
+                    key = licenseKey
+                }, "VALID"
+            else
+                return false, actErr, "MACHINE_LIMIT_EXCEEDED"
+            end
+        end
+    end
+
+    -- 3. กรณีอื่นๆ (คีย์ผิด, หมดอายุ, โดนแบน)
+    local reason = "License Key ไม่ถูกต้อง"
+    if code == "NOT_FOUND" then
+        reason = "ไม่พบคีย์นี้ในระบบ (" .. licenseKey .. ") กรุณาตรวจสอบความถูกต้อง"
+    elseif code == "EXPIRED" then
+        reason = "License Key นี้หมดอายุการใช้งานแล้ว กรุณาติดต่อร้านค้าเพื่อต่ออายุ"
+    elseif code == "SUSPENDED" then
+        reason = "License Key นี้ถูกระงับการใช้งานชั่วคราวหรือถาวร"
+    elseif detail and detail ~= "" then
+        reason = "ตรวจสอบไม่ผ่าน: " .. detail
+    end
+    return false, reason, code
 end
 
 -- =========================================================================
--- 6. KEY INPUT UI (กรณีที่ยังไม่มีการตั้งคีย์ไว้)
+-- 6. KEY INPUT UI (กรณีที่ยังไม่มีการตั้งคีย์ไว้ หรือคีย์เดิมผิด)
 -- =========================================================================
-local function PromptKeyUI(callback)
+local function PromptKeyUI(callback, initialKey, initialError)
     local lp = game:GetService("Players").LocalPlayer
     local pgui = lp:WaitForChild("PlayerGui")
 
@@ -260,6 +334,7 @@ local function PromptKeyUI(callback)
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
     box.PlaceholderText = "กรอก License Key ที่นี่..."
     box.PlaceholderColor3 = Color3.fromRGB(120, 125, 140)
+    box.Text = initialKey or ""
     box.TextSize = 14
     box.Font = Enum.Font.GothamMedium
     box.ClearTextOnFocus = false
@@ -270,7 +345,7 @@ local function PromptKeyUI(callback)
     statusLbl.Size = UDim2.new(1, -40, 0, 20)
     statusLbl.Position = UDim2.new(0, 20, 0, 130)
     statusLbl.BackgroundTransparency = 1
-    statusLbl.Text = ""
+    statusLbl.Text = initialError and ("❌ " .. tostring(initialError)) or ""
     statusLbl.TextColor3 = Color3.fromRGB(255, 90, 90)
     statusLbl.TextSize = 12
     statusLbl.Font = Enum.Font.Gotham
@@ -349,19 +424,22 @@ task.spawn(function()
     AntiTamperCheck()
 
     local key = GetStoredLicenseKey()
+    local initialError = nil
     if key and key ~= "" then
         print("[KEYGEN] กำลังตรวจสอบ License Key อัตโนมัติ: " .. key .. "...")
         local valid, info, code = ValidateKeyWithKeygen(key)
         if valid then
+            SaveLicenseKey(key)
             StartScript(key, info)
             return
         else
             warn("[KEYGEN] คีย์ที่บันทึกไว้ไม่ผ่าน: " .. tostring(info))
+            initialError = info
         end
     end
 
     -- หากยังไม่มีคีย์ หรือคีย์เก่าหมดอายุ ให้แสดงหน้าต่างกรอกคีย์
     PromptKeyUI(function(validKey, info)
         StartScript(validKey, info)
-    end)
+    end, key, initialError)
 end)
